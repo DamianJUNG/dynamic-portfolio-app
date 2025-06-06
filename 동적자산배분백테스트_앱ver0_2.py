@@ -87,20 +87,20 @@ class AssetConfig:
     asset_ticker: str
     weight_decimal: float
     original_weight_input: float
+    indicator_ticker: str
     sma_period: int
 
     def __repr__(self):
-        return (
-            f"AssetConfig(자산='{self.asset_ticker}', 입력비율={self.original_weight_input:.1f}%, "
-            f"최종적용비율={self.weight_decimal*100:.1f}%, "
-            f"MA기간={self.sma_period})"
-        )
+        return (f"AssetConfig(자산='{self.asset_ticker}', 입력비율={self.original_weight_input:.1f}%, "
+                f"최종적용비율={self.weight_decimal*100:.1f}%, "
+                f"지표='{self.indicator_ticker}', MA기간={self.sma_period})")
 
 @dataclass
 class LiveSignal:
     date: pd.Timestamp
     asset_ticker: str
     current_price: float
+    indicator_price: float
     sma_value: float
     momentum_signal: bool
     recommended_weight: float
@@ -108,13 +108,11 @@ class LiveSignal:
 
     def __repr__(self):
         signal_text = "🟢 매수" if self.momentum_signal else "🔴 현금대기"
-        return (
-            f"{self.asset_ticker}: {signal_text} | "
-            f"현재가: ${self.current_price:.2f} | "
-            f"SMA: ${self.sma_value:.2f} | "
-            f"권장비중: {self.recommended_weight*100:.1f}% | "
-            f"신호강도: {self.signal_strength:+.1f}%"
-        )
+        return (f"{self.asset_ticker}: {signal_text} | "
+                f"현재가(지표): ${self.indicator_price:.2f} | "
+                f"SMA: ${self.sma_value:.2f} | "
+                f"권장비중: {self.recommended_weight*100:.1f}% | "
+                f"신호강도: {self.signal_strength:+.1f}%")
 
 # 유틸리티 함수들
 @st.cache_data
@@ -162,6 +160,8 @@ class MarketDataProvider:
         for ac in self.asset_configs:
             if validate_ticker(ac.asset_ticker):
                 tickers.add(ac.asset_ticker)
+            if validate_ticker(ac.indicator_ticker):
+                tickers.add(ac.indicator_ticker)
         return sorted(list(tickers))
 
     def _download_data(self, ticker: str, start_date: pd.Timestamp, end_date: pd.Timestamp) -> pd.DataFrame:
@@ -170,14 +170,8 @@ class MarketDataProvider:
             max_retries = 3
             for attempt in range(max_retries):
                 try:
-                    df = yf.download(
-                        ticker,
-                        start=start_date,
-                        end=end_date,
-                        progress=False,
-                        auto_adjust=False,
-                        timeout=30
-                    )
+                    df = yf.download(ticker, start=start_date, end=end_date,
+                                     progress=False, auto_adjust=False, timeout=30)
 
                     if df.empty:
                         if attempt < max_retries - 1:
@@ -186,19 +180,16 @@ class MarketDataProvider:
                         else:
                             return pd.DataFrame()
 
-                    # MultiIndex 처리
                     if isinstance(df.columns, pd.MultiIndex):
                         df.columns = df.columns.get_level_values(0)
                         df = df.loc[:, ~df.columns.duplicated(keep='first')]
 
-                    # 'Adj Close' 컬럼이 없으면 'Close' 사용
                     if 'Adj Close' not in df.columns:
                         if 'Close' in df.columns:
                             df['Adj Close'] = df['Close']
                         else:
                             return pd.DataFrame()
 
-                    # 숫자형으로 강제 변환
                     for col in ['Open', 'High', 'Low', 'Close', 'Adj Close', 'Volume']:
                         if col in df.columns:
                             df[col] = pd.to_numeric(df[col], errors='coerce')
@@ -223,18 +214,19 @@ class MarketDataProvider:
             return pd.DataFrame()
 
     def load_all_data(self):
-        """모든 데이터 로드 및 가격, SMA 계산"""
+        """모든 데이터 로드"""
         if not self.all_tickers:
             st.error("유효한 티커가 없습니다.")
             return False
 
         progress_bar = st.progress(0)
         status_text = st.empty()
+
         successful_downloads = 0
 
-        # 1) 모든 티커의 가격 데이터 다운로드
         for i, ticker in enumerate(self.all_tickers):
             status_text.text(f'📡 데이터 다운로드 중: {ticker} ({i+1}/{len(self.all_tickers)})')
+
             df = self._download_data(ticker, self.data_start_date, self.data_end_date)
 
             if not df.empty:
@@ -254,27 +246,24 @@ class MarketDataProvider:
 
         status_text.text('📊 SMA 계산 중...')
 
-        # 2) AssetConfig별로 해당 자산의 SMA 계산
         try:
             for ac in self.asset_configs:
-                sma_key = (ac.asset_ticker, ac.sma_period)
+                sma_key = (ac.indicator_ticker, ac.sma_period)
                 if sma_key in self.sma_data:
                     continue
 
-                if ac.asset_ticker in self.price_data:
-                    price_series = self.price_data[ac.asset_ticker]
+                if ac.indicator_ticker in self.price_data:
+                    price_series = self.price_data[ac.indicator_ticker]
                     if len(price_series) >= ac.sma_period:
                         sma_series = price_series.rolling(
-                            window=ac.sma_period, min_periods=ac.sma_period
-                        ).mean()
+                            window=ac.sma_period, min_periods=ac.sma_period).mean()
                         self.sma_data[sma_key] = sma_series
                     else:
-                        st.warning(f"⚠️ {ac.asset_ticker}: SMA {ac.sma_period}일 계산에 필요한 데이터 부족")
+                        st.warning(f"⚠️ {ac.indicator_ticker}: SMA {ac.sma_period}일 계산에 필요한 데이터 부족")
                         self.sma_data[sma_key] = pd.Series(dtype=float, index=price_series.index)
                 else:
-                    st.warning(f"⚠️ {ac.asset_ticker}: 가격 데이터 없음")
+                    st.warning(f"⚠️ {ac.indicator_ticker}: 가격 데이터 없음")
                     self.sma_data[sma_key] = pd.Series(dtype=float)
-
         except Exception as e:
             st.error(f"SMA 계산 오류: {e}")
             return False
@@ -286,10 +275,9 @@ class MarketDataProvider:
             st.warning(f"⚠️ 다운로드 실패 티커: {', '.join(self.failed_tickers)}")
 
         st.success(f"✅ 총 {successful_downloads}/{len(self.all_tickers)}개 티커 데이터 로드 완료")
-        return True
+        return successful_downloads > 0
 
     def get_price_on_date(self, ticker: str, date: pd.Timestamp) -> Optional[float]:
-        """특정 날짜의 가격 조회 (asof 방식)"""
         try:
             if ticker in self.price_data:
                 series = self.price_data[ticker]
@@ -302,10 +290,9 @@ class MarketDataProvider:
         except Exception:
             return None
 
-    def get_sma_on_date(self, asset_ticker: str, sma_period: int, date: pd.Timestamp) -> Optional[float]:
-        """특정 날짜의 SMA 조회 (asof 방식)"""
+    def get_sma_on_date(self, indicator_ticker: str, sma_period: int, date: pd.Timestamp) -> Optional[float]:
         try:
-            sma_key = (asset_ticker, sma_period)
+            sma_key = (indicator_ticker, sma_period)
             if sma_key in self.sma_data:
                 series = self.sma_data[sma_key]
                 if series.empty:
@@ -320,7 +307,6 @@ class MarketDataProvider:
             return None
 
     def get_return_for_period(self, ticker: str, start_date: pd.Timestamp, end_date: pd.Timestamp) -> float:
-        """기간 수익률 계산"""
         try:
             price_start = self.get_price_on_date(ticker, start_date)
             price_end = self.get_price_on_date(ticker, end_date)
@@ -353,18 +339,21 @@ class Portfolio:
     def update_value_from_period_returns(self, period_asset_returns: Dict[str, float]):
         if not self.weights:
             return
+
         portfolio_period_return = 0.0
         for asset_ticker, weight in self.weights.items():
             asset_return = period_asset_returns.get(asset_ticker, 0.0)
             if pd.isna(asset_return):
                 asset_return = 0.0
             portfolio_period_return += weight * asset_return
+
         self.current_value *= (1 + portfolio_period_return)
 
     def rebalance_to_target_weights(self, target_weights: Dict[str, float],
                                    transaction_cost_rate: float, slippage_rate: float) -> float:
         total_weight_change = 0.0
         all_assets = set(self.weights.keys()) | set(target_weights.keys())
+
         for asset_ticker in all_assets:
             current_w = self.weights.get(asset_ticker, 0.0)
             target_w = target_weights.get(asset_ticker, 0.0)
@@ -372,6 +361,7 @@ class Portfolio:
 
         traded_portion = total_weight_change / 2.0
         costs = self.current_value * traded_portion * (transaction_cost_rate + slippage_rate)
+
         self.current_value -= costs
         if self.current_value < 0:
             self.current_value = 0.0
@@ -398,13 +388,11 @@ class Backtester:
         self.trade_log = []
 
     def _generate_rebalancing_dates(self) -> pd.DatetimeIndex:
-        """리밸런싱 날짜 생성"""
         try:
             if not self.asset_configs:
                 return pd.DatetimeIndex([])
 
-            # 첫 번째 자산의 price_data index를 기준으로 삼음
-            ref_ticker = self.asset_configs[0].asset_ticker
+            ref_ticker = self.asset_configs[0].indicator_ticker
             if ref_ticker not in self.dataprovider.price_data:
                 st.warning(f"기준 티커 {ref_ticker} 데이터가 없습니다.")
                 return pd.DatetimeIndex([])
@@ -443,19 +431,21 @@ class Backtester:
             return pd.DatetimeIndex([])
 
     def _get_momentum_decision(self, asset_config: AssetConfig, date: pd.Timestamp) -> bool:
-        """모멘텀 신호 판정: '투자 자산의 현재가 > 투자 자산의 SMA' 비교"""
+        """
+        모멘텀 결정을 위해 지표 자산의 가격과 지표 자산의 SMA를 비교하도록 수정.
+        """
         try:
-            price = self.dataprovider.get_price_on_date(asset_config.asset_ticker, date)
-            sma = self.dataprovider.get_sma_on_date(asset_config.asset_ticker,
+            # 지표 자산의 가격을 가져옴
+            indicator_price = self.dataprovider.get_price_on_date(asset_config.indicator_ticker, date)
+            sma = self.dataprovider.get_sma_on_date(asset_config.indicator_ticker,
                                                    asset_config.sma_period, date)
-            if price is None or sma is None:
+            if indicator_price is None or sma is None:
                 return False
-            return price > sma
+            return indicator_price > sma
         except Exception:
             return False
 
     def _calculate_target_weights(self, momentum_assets: List[AssetConfig]) -> Dict[str, float]:
-        """모멘텀에 해당하는 자산들을 모아서 최종 목표 비중 계산"""
         target_weights = {}
         method = self.params['rebalancing_method']
 
@@ -482,7 +472,6 @@ class Backtester:
         return {k: v for k, v in target_weights.items() if abs(v) > 1e-6}
 
     def _setup_initial_benchmark_weights(self):
-        """벤치마크(Buy & Hold) 초기 비중 세팅"""
         initial_weights = {ac.asset_ticker: ac.weight_decimal for ac in self.asset_configs}
         cash_w = 1.0 - sum(initial_weights.values())
         if cash_w > 1e-6:
@@ -490,7 +479,6 @@ class Backtester:
         self.benchmark_portfolio.weights = initial_weights.copy()
 
     def run_backtest(self):
-        """백테스트 실행"""
         try:
             if self.rebalancing_dates.empty:
                 st.error("리밸런싱 날짜가 없습니다.")
@@ -505,10 +493,11 @@ class Backtester:
 
             for i, current_date in enumerate(self.rebalancing_dates):
                 status_text.text(f'⚙️ 백테스트 진행: {current_date.strftime("%Y-%m-%d")} ({i+1}/{len(self.rebalancing_dates)})')
+
                 prev_date = self.portfolio.history[-1]['date']
 
                 if current_date > prev_date:
-                    # 두 포트폴리오 모두 해당 기간 수익률을 계산하여 가치 업데이트
+                    # 포트폴리오 가치 업데이트
                     strategy_returns = {
                         asset: (0.0 if asset == 'CASH' else
                                self.dataprovider.get_return_for_period(asset, prev_date, current_date))
@@ -524,16 +513,13 @@ class Backtester:
                     self.benchmark_portfolio.update_value_from_period_returns(benchmark_returns)
 
                 # 모멘텀 신호 확인 및 리밸런싱
-                momentum_assets = [
-                    ac for ac in self.asset_configs
-                    if self._get_momentum_decision(ac, current_date)
-                ]
+                momentum_assets = [ac for ac in self.asset_configs
+                                 if self._get_momentum_decision(ac, current_date)]
                 target_weights = self._calculate_target_weights(momentum_assets)
 
                 value_before = self.portfolio.current_value
                 costs = self.portfolio.rebalance_to_target_weights(
-                    target_weights, self.params['transaction_cost_rate'], self.params['slippage_rate']
-                )
+                    target_weights, self.params['transaction_cost_rate'], self.params['slippage_rate'])
 
                 self.trade_log.append({
                     'date': current_date,
@@ -545,10 +531,12 @@ class Backtester:
 
                 self.portfolio.record_state(current_date, "Rebalanced")
                 self.benchmark_portfolio.record_state(current_date, "Benchmark Update")
+
                 progress_bar.progress((i + 1) / len(self.rebalancing_dates))
 
             progress_bar.empty()
             status_text.empty()
+
             return self.portfolio.history, self.benchmark_portfolio.history, self.trade_log
 
         except Exception as e:
@@ -562,30 +550,35 @@ class LiveSignalGenerator:
         self.dataprovider = dataprovider
 
     def generate_signals(self, target_date: pd.Timestamp, method: str = 'A') -> Tuple[List[LiveSignal], Dict[str, float]]:
-        """특정 날짜에 대한 실시간 모멘텀 신호 생성"""
         signals = []
         momentum_assets = []
 
         for config in self.asset_configs:
-            current_price = self.dataprovider.get_price_on_date(config.asset_ticker, target_date)
-            sma_value = self.dataprovider.get_sma_on_date(config.asset_ticker,
+            # 지표 자산의 가격을 가져옴
+            indicator_price = self.dataprovider.get_price_on_date(config.indicator_ticker, target_date)
+            sma_value = self.dataprovider.get_sma_on_date(config.indicator_ticker,
                                                         config.sma_period, target_date)
 
-            if current_price is None or sma_value is None:
+            if indicator_price is None or sma_value is None:
                 continue
 
-            momentum_signal = current_price > sma_value
-            signal_strength = ((current_price / sma_value) - 1) * 100
+            # 지표 자산 가격과 SMA를 비교
+            momentum_signal = indicator_price > sma_value
+            # 신호 강도 계산도 지표 자산 가격 기준으로 수정
+            signal_strength = ((indicator_price / sma_value) - 1) * 100
 
+            # LiveSignal에 asset_ticker는 그대로, current_price에는 지표 가격을 표시
             signal = LiveSignal(
                 date=target_date,
                 asset_ticker=config.asset_ticker,
-                current_price=current_price,
+                current_price=indicator_price,
+                indicator_price=indicator_price,
                 sma_value=sma_value,
                 momentum_signal=momentum_signal,
                 recommended_weight=0.0,
                 signal_strength=signal_strength
             )
+
             signals.append(signal)
             if momentum_signal:
                 momentum_assets.append(config)
@@ -593,14 +586,13 @@ class LiveSignalGenerator:
         # 포트폴리오 비중 계산
         portfolio_weights = self._calculate_portfolio_weights(momentum_assets, method)
 
-        # 신호 객체에 권장 비중 업데이트
+        # 신호에 권장 비중 업데이트
         for signal in signals:
             signal.recommended_weight = portfolio_weights.get(signal.asset_ticker, 0.0)
 
         return signals, portfolio_weights
 
     def _calculate_portfolio_weights(self, momentum_assets: List[AssetConfig], method: str) -> Dict[str, float]:
-        """실시간 모멘텀 자산을 모아 목표 비중 산출"""
         weights = {}
 
         if not momentum_assets:
@@ -619,6 +611,7 @@ class LiveSignalGenerator:
             for ac in momentum_assets:
                 weights[ac.asset_ticker] = ac.weight_decimal
                 total_weight += ac.weight_decimal
+
             cash_weight = 1.0 - total_weight
             if cash_weight > 0:
                 weights['CASH'] = cash_weight
@@ -627,7 +620,6 @@ class LiveSignalGenerator:
 
 # 분석 함수들
 def history_to_df(history_list: List[Dict]) -> pd.DataFrame:
-    """백테스트 히스토리(딕셔너리 리스트)를 DataFrame으로 변환"""
     if not history_list:
         return pd.DataFrame()
     df = pd.DataFrame(history_list)
@@ -647,6 +639,7 @@ def calculate_annual_returns(portfolio_df: pd.DataFrame, initial_capital: float)
         for year, end_value in annual_values.items():
             if pd.isna(end_value):
                 continue
+
             year_return = (end_value / prev_value - 1) * 100
             annual_returns.append({
                 'Year': year.year,
@@ -664,7 +657,7 @@ def calculate_annual_returns(portfolio_df: pd.DataFrame, initial_capital: float)
         return pd.DataFrame()
 
 def calculate_performance_metrics(portfolio_df: pd.DataFrame, params: Dict) -> Dict:
-    """성과 지표 계산 (CAGR, Total Return, Volatility, Sharpe, MaxDD, Win Rate 등)"""
+    """성과 지표 계산"""
     try:
         if portfolio_df.empty or 'portfolio_value' not in portfolio_df.columns:
             return {}
@@ -720,7 +713,7 @@ def calculate_performance_metrics(portfolio_df: pd.DataFrame, params: Dict) -> D
 
 # 시각화 함수들
 def create_performance_chart(strategy_df: pd.DataFrame, benchmark_df: pd.DataFrame, initial_capital: float):
-    """성과 차트 생성 (누적 수익률 비교 + 최대 드로우다운)"""
+    """성과 차트 생성 (수익률 + MDD)"""
     try:
         fig = make_subplots(
             rows=2, cols=1,
@@ -730,7 +723,6 @@ def create_performance_chart(strategy_df: pd.DataFrame, benchmark_df: pd.DataFra
             specs=[[{"secondary_y": False}], [{"secondary_y": False}]]
         )
 
-        # 누적 수익률
         if not strategy_df.empty and 'portfolio_value' in strategy_df.columns:
             strategy_cum = strategy_df['portfolio_value'] / initial_capital
             fig.add_trace(
@@ -757,9 +749,7 @@ def create_performance_chart(strategy_df: pd.DataFrame, benchmark_df: pd.DataFra
                 row=1, col=1
             )
 
-        # 드로우다운
         if not strategy_df.empty:
-            strategy_cum = strategy_df['portfolio_value'] / initial_capital
             strategy_dd = calculate_drawdown(strategy_cum) * 100
             fig.add_trace(
                 go.Scatter(
@@ -775,7 +765,6 @@ def create_performance_chart(strategy_df: pd.DataFrame, benchmark_df: pd.DataFra
             )
 
         if not benchmark_df.empty:
-            benchmark_cum = benchmark_df['portfolio_value'] / initial_capital
             benchmark_dd = calculate_drawdown(benchmark_cum) * 100
             fig.add_trace(
                 go.Scatter(
@@ -823,6 +812,7 @@ def create_signals_chart(signals: List[LiveSignal]):
             return None
 
         fig = go.Figure()
+
         assets = [s.asset_ticker for s in signals]
         colors = ['#00cc44' if s.momentum_signal else '#ff4444' for s in signals]
         strengths = [s.signal_strength for s in signals]
@@ -831,7 +821,7 @@ def create_signals_chart(signals: List[LiveSignal]):
             x=assets,
             y=strengths,
             marker_color=colors,
-            text=[f"{s:.1f}%" for s in strengths],
+            text=[f"{s:+.1f}%" for s in strengths],
             textposition='auto',
             hovertemplate='자산: %{x}<br>신호 강도: %{y:.1f}%<extra></extra>'
         ))
@@ -844,6 +834,7 @@ def create_signals_chart(signals: List[LiveSignal]):
             height=400,
             showlegend=False
         )
+
         fig.add_hline(y=0, line_dash="dash", line_color="black")
 
         return fig
@@ -885,6 +876,7 @@ def create_annual_comparison_chart(strategy_annual: pd.DataFrame, benchmark_annu
             height=400,
             barmode='group'
         )
+
         fig.add_hline(y=0, line_dash="dash", line_color="black")
 
         return fig
@@ -924,6 +916,7 @@ def main():
                         asset_ticker = st.text_input("자산 티커", placeholder="예: SPY").upper().strip()
                         weight = st.number_input("투자 비율 (%)", min_value=0.0, max_value=100.0, value=25.0)
                     with col2:
+                        indicator_ticker = st.text_input("지표 티커", placeholder="예: SPY").upper().strip()
                         sma_period = st.number_input("SMA 기간", min_value=5, max_value=500, value=200)
 
                     add_asset = st.form_submit_button("자산 추가")
@@ -934,10 +927,14 @@ def main():
                         elif not validate_ticker(asset_ticker):
                             st.error("올바른 티커 형식이 아닙니다.")
                         else:
+                            if not indicator_ticker:
+                                indicator_ticker = asset_ticker
+
                             new_config = AssetConfig(
                                 asset_ticker=asset_ticker,
                                 weight_decimal=weight/100.0,
                                 original_weight_input=weight,
+                                indicator_ticker=indicator_ticker,
                                 sma_period=sma_period
                             )
                             st.session_state.asset_configs.append(new_config)
@@ -970,10 +967,12 @@ def main():
 
             # 백테스트 설정
             st.subheader("2. 백테스트 설정")
+
             col1, col2 = st.columns(2)
             with col1:
                 start_year = st.selectbox("시작 연도", range(2000, 2025), index=20)
                 start_month = st.selectbox("시작 월", range(1, 13), index=0)
+
             with col2:
                 use_today = st.checkbox("오늘까지 분석", value=True)
                 if not use_today:
@@ -981,9 +980,9 @@ def main():
                     end_month = st.selectbox("종료 월", range(1, 13), index=11)
 
             frequency = st.selectbox("리밸런싱 빈도", ["월말 (M)", "주간 금요일 (W)"], index=0)
-            method = st.selectbox("리밸런싱 방법", ["상대적 비율 유지", "고정 비율 + 현금"], index=0)
+            method = st.selectbox("리밸런싱 방법",
+                                  ["상대적 비율 유지", "고정 비율 + 현금"], index=0)
 
-            # 거래 비용
             st.subheader("3. 거래 비용")
             col1, col2 = st.columns(2)
             with col1:
@@ -993,40 +992,46 @@ def main():
                 initial_capital = st.number_input("초기 자본 ($)", min_value=1000, value=10000, step=1000)
                 risk_free_rate = st.number_input("무위험 이자율 (%)", min_value=0.0, max_value=10.0, value=2.0, step=0.1)
 
-        # 메인 화면 안내
+        # 메인 화면 (자산 미등록 시)
         if not st.session_state.asset_configs:
             st.warning("⚠️ 포트폴리오 구성을 위해 사이드바에서 자산을 추가해주세요.")
+
+            # 샘플 포트폴리오 제안
             st.subheader("💡 샘플 포트폴리오")
             col1, col2, col3 = st.columns(3)
+
             with col1:
                 if st.button("🏛️ 안정형", use_container_width=True):
                     st.session_state.asset_configs = [
-                        AssetConfig("SPY", 0.6, 60.0, 200),
-                        AssetConfig("TLT", 0.4, 40.0, 200)
+                        AssetConfig("SPY", 0.6, 60.0, "SPY", 200),
+                        AssetConfig("TLT", 0.4, 40.0, "TLT", 200)
                     ]
                     st.rerun()
+
             with col2:
                 if st.button("⚖️ 균형형", use_container_width=True):
                     st.session_state.asset_configs = [
-                        AssetConfig("SPY", 0.4, 40.0, 200),
-                        AssetConfig("QQQ", 0.3, 30.0, 200),
-                        AssetConfig("VEA", 0.3, 30.0, 200)
+                        AssetConfig("SPY", 0.4, 40.0, "SPY", 200),
+                        AssetConfig("QQQ", 0.3, 30.0, "QQQ", 200),
+                        AssetConfig("VEA", 0.3, 30.0, "VEA", 200)
                     ]
                     st.rerun()
+
             with col3:
                 if st.button("🚀 공격형", use_container_width=True):
                     st.session_state.asset_configs = [
-                        AssetConfig("QQQ", 0.5, 50.0, 200),
-                        AssetConfig("SPY", 0.3, 30.0, 200),
-                        AssetConfig("IWM", 0.2, 20.0, 200)
+                        AssetConfig("QQQ", 0.5, 50.0, "QQQ", 200),
+                        AssetConfig("SPY", 0.3, 30.0, "SPY", 200),
+                        AssetConfig("IWM", 0.2, 20.0, "IWM", 200)
                     ]
                     st.rerun()
+
             return
 
-        # 백테스트 시작 버튼
+        # 분석 시작 버튼
         if st.button("🚀 백테스트 시작", type="primary", use_container_width=True):
             with st.spinner("분석을 시작합니다..."):
-                # 날짜 설정
+                # 파라미터 구성
                 start_date = f"{start_year}-{start_month:02d}-01"
                 if use_today:
                     end_date = datetime.now().strftime('%Y-%m-%d')
@@ -1044,7 +1049,7 @@ def main():
                     'risk_free_rate': risk_free_rate / 100.0
                 }
 
-                # 데이터 로드 버퍼 계산 (SMA를 계산하기 위한 여분 기간)
+                # 데이터 버퍼 계산
                 max_sma = max(ac.sma_period for ac in st.session_state.asset_configs)
                 buffer_days = int(max_sma * 1.5 + 60)
                 data_start = (pd.to_datetime(start_date) - pd.Timedelta(days=buffer_days)).strftime('%Y-%m-%d')
@@ -1052,6 +1057,7 @@ def main():
                 # 데이터 로드
                 dataprovider = MarketDataProvider(st.session_state.asset_configs, data_start, end_date)
                 success = dataprovider.load_all_data()
+
                 if not success:
                     st.error("❌ 데이터 로드에 실패했습니다. 티커를 확인해주세요.")
                     return
@@ -1059,6 +1065,7 @@ def main():
                 # 백테스트 실행
                 backtester = Backtester(st.session_state.asset_configs, backtest_params, dataprovider)
                 strategy_history, benchmark_history, trade_log = backtester.run_backtest()
+
                 if not strategy_history:
                     st.error("❌ 백테스트 실행에 실패했습니다.")
                     return
@@ -1067,8 +1074,7 @@ def main():
                 signal_generator = LiveSignalGenerator(st.session_state.asset_configs, dataprovider)
                 end_date_ts = pd.to_datetime(end_date)
                 signals, portfolio_weights = signal_generator.generate_signals(
-                    end_date_ts, backtest_params['rebalancing_method']
-                )
+                    end_date_ts, backtest_params['rebalancing_method'])
 
                 # 결과 분석
                 strategy_df = history_to_df(strategy_history)
@@ -1085,27 +1091,38 @@ def main():
 
                 # 핵심 성과 지표
                 st.header("📊 핵심 성과 지표")
+
                 col1, col2, col3, col4, col5 = st.columns(5)
+
                 with col1:
                     strategy_cagr = strategy_metrics.get('CAGR (%)', 0)
                     benchmark_cagr = benchmark_metrics.get('CAGR (%)', 0)
-                    st.metric("전략 CAGR", f"{strategy_cagr:.2f}%", f"{strategy_cagr - benchmark_cagr:+.2f}%p")
+                    st.metric("전략 CAGR", f"{strategy_cagr:.2f}%",
+                             f"{strategy_cagr - benchmark_cagr:+.2f}%p")
+
                 with col2:
                     strategy_mdd = strategy_metrics.get('Max Drawdown (%)', 0)
                     benchmark_mdd = benchmark_metrics.get('Max Drawdown (%)', 0)
-                    st.metric("최대 낙폭", f"{strategy_mdd:.2f}%", f"{strategy_mdd - benchmark_mdd:+.2f}%p")
+                    st.metric("최대 낙폭", f"{strategy_mdd:.2f}%",
+                             f"{strategy_mdd - benchmark_mdd:+.2f}%p")
+
                 with col3:
                     strategy_sharpe = strategy_metrics.get('Sharpe Ratio', 0)
                     benchmark_sharpe = benchmark_metrics.get('Sharpe Ratio', 0)
-                    st.metric("샤프 비율", f"{strategy_sharpe:.3f}", f"{strategy_sharpe - benchmark_sharpe:+.3f}")
+                    st.metric("샤프 비율", f"{strategy_sharpe:.3f}",
+                             f"{strategy_sharpe - benchmark_sharpe:+.3f}")
+
                 with col4:
                     strategy_return = strategy_metrics.get('Total Return (%)', 0)
                     benchmark_return = benchmark_metrics.get('Total Return (%)', 0)
-                    st.metric("총 수익률", f"{strategy_return:.1f}%", f"{strategy_return - benchmark_return:+.1f}%p")
+                    st.metric("총 수익률", f"{strategy_return:.1f}%",
+                             f"{strategy_return - benchmark_return:+.1f}%p")
+
                 with col5:
                     strategy_vol = strategy_metrics.get('Volatility (%)', 0)
                     benchmark_vol = benchmark_metrics.get('Volatility (%)', 0)
-                    st.metric("변동성", f"{strategy_vol:.1f}%", f"{strategy_vol - benchmark_vol:+.1f}%p")
+                    st.metric("변동성", f"{strategy_vol:.1f}%",
+                             f"{strategy_vol - benchmark_vol:+.1f}%p")
 
                 # 성과 차트
                 st.header("📈 성과 차트")
@@ -1116,11 +1133,14 @@ def main():
                 # 연간 수익률 비교
                 if not strategy_annual.empty or not benchmark_annual.empty:
                     st.subheader("📊 연간 수익률 비교")
+
                     col1, col2 = st.columns(2)
+
                     with col1:
                         annual_chart = create_annual_comparison_chart(strategy_annual, benchmark_annual)
                         if annual_chart:
                             st.plotly_chart(annual_chart, use_container_width=True)
+
                     with col2:
                         if not strategy_annual.empty and not benchmark_annual.empty:
                             comparison_df = pd.DataFrame({
@@ -1133,8 +1153,10 @@ def main():
 
                 # 실시간 신호
                 st.header("🎯 실시간 투자 신호")
+
                 if signals:
                     buy_signals = sum(1 for s in signals if s.momentum_signal)
+
                     col1, col2, col3 = st.columns(3)
                     with col1:
                         st.metric("분석 기준일", end_date_ts.strftime('%Y-%m-%d'))
@@ -1144,12 +1166,13 @@ def main():
                         signal_ratio = buy_signals / len(signals) * 100
                         st.metric("신호 비율", f"{signal_ratio:.1f}%")
 
+                    # 신호 상세
                     signal_data = []
                     for s in signals:
                         signal_data.append({
                             '자산': s.asset_ticker,
-                            '현재가': f"${s.current_price:.2f}",
-                            'SMA': f"${s.sma_value:.2f}",
+                            '현재가(지표)': f"${s.indicator_price:.2f}",
+                            f'SMA{s.sma_period if hasattr(s, "sma_period") else ""}': f"${s.sma_value:.2f}",
                             '신호': "🟢 매수" if s.momentum_signal else "🔴 현금대기",
                             '신호강도': f"{s.signal_strength:+.1f}%",
                             '권장비중': f"{s.recommended_weight*100:.1f}%"
@@ -1158,15 +1181,18 @@ def main():
                     signal_df = pd.DataFrame(signal_data)
                     st.dataframe(signal_df, use_container_width=True)
 
+                    # 신호 차트
                     signals_chart = create_signals_chart(signals)
                     if signals_chart:
                         st.plotly_chart(signals_chart, use_container_width=True)
 
-                # 권장 포트폴리오 구성
+                # 포트폴리오 권장사항
                 st.subheader("💼 권장 포트폴리오 구성")
+
                 if portfolio_weights:
                     portfolio_data = []
-                    for asset, weight in sorted(portfolio_weights.items(), key=lambda x: x[1], reverse=True):
+                    for asset, weight in sorted(portfolio_weights.items(),
+                                                key=lambda x: x[1], reverse=True):
                         if weight > 0.001:
                             investment_amount = initial_capital * weight
                             portfolio_data.append({
@@ -1175,21 +1201,91 @@ def main():
                                 '투자 금액': f"${investment_amount:,.0f}",
                                 '상태': "현금 대기" if asset == 'CASH' else "투자 대상"
                             })
+
                     portfolio_df = pd.DataFrame(portfolio_data)
                     st.dataframe(portfolio_df, use_container_width=True)
 
                 # 상세 성과 표
                 st.header("📋 상세 성과 분석")
+
                 col1, col2 = st.columns(2)
+
                 with col1:
                     st.subheader("동적자산배분 전략")
                     strategy_detail = pd.DataFrame([
-                        {'지표': k, '값': f"{v:.3f}" if isinstance(v, (int, float)) and k != 'Final Value' else f"${v:,.0f}" if k == 'Final Value' else str(v)}
+                        {
+                            '지표': k,
+                            '값': (
+                                f"{v:.3f}" if isinstance(v, (int, float)) and k != 'Final Value'
+                                else f"${v:,.0f}" if k == 'Final Value'
+                                else str(v)
+                            )
+                        }
                         for k, v in strategy_metrics.items()
-                    ])
+                    ])  # ← 리스트 및 괄호 닫기
+
                     st.dataframe(strategy_detail, use_container_width=True)
+
                 with col2:
                     st.subheader("Buy & Hold 벤치마크")
                     benchmark_detail = pd.DataFrame([
-                        {'지표': k, '값': f"{v:.3f}" if isinstance(v, (int, float)) and k != 'Final Value' else f"${v:,.0f}" if k == 'Final Value' else str(v)}
-                        for k, v in benchmark
+                        {
+                            '지표': k,
+                            '값': (
+                                f"{v:.3f}" if isinstance(v, (int, float)) and k != 'Final Value'
+                                else f"${v:,.0f}" if k == 'Final Value'
+                                else str(v)
+                            )
+                        }
+                        for k, v in benchmark_metrics.items()
+                    ])  # ← 리스트 및 pd.DataFrame 괄호를 정확히 닫음
+
+                    st.dataframe(benchmark_detail, use_container_width=True)
+
+                # 데이터 다운로드
+                st.header("💾 결과 다운로드")
+
+                col1, col2, col3 = st.columns(3)
+
+                with col1:
+                    if not strategy_df.empty:
+                        csv = strategy_df.to_csv()
+                        st.download_button(
+                            label="📊 포트폴리오 히스토리",
+                            data=csv,
+                            file_name=f"portfolio_history_{datetime.now().strftime('%Y%m%d')}.csv",
+                            mime="text/csv",
+                            use_container_width=True
+                        )
+
+                with col2:
+                    if signals:
+                        signals_csv = signal_df.to_csv(index=False)
+                        st.download_button(
+                            label="🎯 실시간 신호",
+                            data=signals_csv,
+                            file_name=f"live_signals_{datetime.now().strftime('%Y%m%d')}.csv",
+                            mime="text/csv",
+                            use_container_width=True
+                        )
+
+                with col3:
+                    if trade_log:
+                        trade_df = pd.DataFrame(trade_log)
+                        trade_csv = trade_df.to_csv(index=False)
+                        st.download_button(
+                            label="📈 거래 내역",
+                            data=trade_csv,
+                            file_name=f"trade_log_{datetime.now().strftime('%Y%m%d')}.csv",
+                            mime="text/csv",
+                            use_container_width=True
+                        )
+
+    except Exception as e:
+        st.error(f"❌ 앱 실행 중 오류가 발생했습니다: {e}")
+        st.error("페이지를 새로고침하고 다시 시도해주세요.")
+        with st.expander("상세 오류 정보"):
+            st.code(traceback.format_exc())
+
+if __name__ == "__main__":
+    main()
